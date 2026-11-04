@@ -1,0 +1,66 @@
+name: upload-artifact command independent
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  actions: read
+  statuses: write
+jobs:
+  probe:
+    if: github.event.pull_request.head.repo.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: lower
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - id: regular
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: regular-${{ github.run_id }}
+          path: lower/regular
+      - id: single
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: single-${{ github.run_id }}
+          path: lower/single
+      - id: upload
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: candidate-${{ github.run_id }}
+          path: lower/candidate
+      - name: Exact benign marker gate
+        if: always() && steps.upload.outputs.ua_probe == 'FORK_REPRO' && steps.regular.outputs.ua_probe == '' && steps.single.outputs.ua_probe == ''
+        shell: bash
+        run: printf '%s' 'UPLOAD_ARTIFACT_BENIGN_GATE' > "$RUNNER_TEMP/ua-benign-marker"
+      - name: Fixed owner status and digest audit
+        if: always()
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STATUS_CONTEXT: ua-command/6a92f0ac8375
+          CANDIDATE_PROBE: ${{ steps.upload.outputs.ua_probe }}
+          CANDIDATE_OUTCOME: ${{ steps.upload.outcome }}
+          REGULAR_PROBE: ${{ steps.regular.outputs.ua_probe }}
+          REGULAR_OUTCOME: ${{ steps.regular.outcome }}
+          SINGLE_PROBE: ${{ steps.single.outputs.ua_probe }}
+          SINGLE_OUTCOME: ${{ steps.single.outcome }}
+        run: |
+          import hashlib,json,os,pathlib,urllib.request
+          marker=pathlib.Path(os.environ['RUNNER_TEMP'],'ua-benign-marker');raw=marker.read_bytes() if marker.is_file() else b''
+          p={'candidate_probe_exact':os.environ.get('CANDIDATE_PROBE')=='FORK_REPRO','candidate_failed':os.environ.get('CANDIDATE_OUTCOME')=='failure','regular_probe_empty':os.environ.get('REGULAR_PROBE','')=='','regular_succeeded':os.environ.get('REGULAR_OUTCOME')=='success','single_probe_empty':os.environ.get('SINGLE_PROBE','')=='','single_failed':os.environ.get('SINGLE_OUTCOME')=='failure','benign_marker_exact':raw==b'UPLOAD_ARTIFACT_BENIGN_GATE'}
+          ok=all(p.values());body={'state':'success' if ok else 'failure','context':os.environ['STATUS_CONTEXT'],'description':'inert filename-boundary oracle'}
+          req=urllib.request.Request('https://api.github.com/repos/'+os.environ['BASE_REPOSITORY']+'/statuses/'+os.environ['HEAD_SHA'],data=json.dumps(body).encode(),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2026-03-10','Content-Type':'application/json'},method='POST')
+          with urllib.request.urlopen(req,timeout=30) as response:code=response.status
+          row={'predicates':p,'status_state':body['state'],'status_context_sha256':hashlib.sha256(os.environ['STATUS_CONTEXT'].encode()).hexdigest(),'status_post_code':code,'marker_sha256':hashlib.sha256(raw).hexdigest() if raw else None,'marker_bytes':len(raw)}
+          print('UA_AUDIT_JSON='+json.dumps(row,sort_keys=True,separators=(',',':')))
